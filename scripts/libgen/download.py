@@ -35,16 +35,29 @@ def resolve_direct_url(mirror_url: str, *, session: requests.Session) -> Optiona
     soup = BeautifulSoup(resp.text, "html.parser")
     base = resp.url
 
-    # Strategy 1: visible text match
-    for a in soup.find_all("a", href=True):
-        text = a.get_text(strip=True)
-        if _GET_TEXT_RE.match(text):
-            return _absolutize(base, a["href"])
+    def _is_real_href(href: str) -> bool:
+        if not href:
+            return False
+        stripped = href.strip()
+        return stripped and stripped != "#" and not stripped.startswith("javascript:")
 
-    # Strategy 2: CDN-like href
+    # Strategy 1: href pointing at a CDN-style download endpoint.
+    # Checked first because it's the specific libgen.vg direct link
+    # (get.php?md5=...&key=...), avoiding confusion with nav "DOWNLOAD" links.
     for a in soup.find_all("a", href=True):
         href = a["href"]
+        if not _is_real_href(href):
+            continue
         if any(tok in href for tok in ("get.php", "fast_download", "/cdn/", "download.php", "/download/")):
+            return _absolutize(base, href)
+
+    # Strategy 2: visible text match on a real href.
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not _is_real_href(href):
+            continue
+        text = a.get_text(strip=True)
+        if _GET_TEXT_RE.match(text):
             return _absolutize(base, href)
 
     return None
@@ -62,7 +75,11 @@ def _absolutize(base: str, href: str) -> str:
 
 
 def download_file(url: str, dest: Path, *, session: requests.Session) -> bool:
-    """Stream-download a URL to dest with a progress bar. Returns True on success."""
+    """Stream-download a URL to dest with a progress bar. Returns True on success.
+
+    Validates the result has plausible file magic bytes (%PDF- for PDF,
+    PK\\x03\\x04 for EPUB/ZIP). This catches HTML error pages served as 200.
+    """
     try:
         with session.get(url, stream=True, timeout=120) as resp:
             resp.raise_for_status()
@@ -75,8 +92,10 @@ def download_file(url: str, dest: Path, *, session: requests.Session) -> bool:
                     if chunk:
                         f.write(chunk)
                         bar.update(len(chunk))
-        # Reject obviously-wrong downloads (HTML error pages served as 200)
         if dest.stat().st_size < 1024:
+            dest.unlink(missing_ok=True)
+            return False
+        if not _looks_like_book(dest):
             dest.unlink(missing_ok=True)
             return False
         return True
@@ -84,6 +103,13 @@ def download_file(url: str, dest: Path, *, session: requests.Session) -> bool:
         if dest.exists():
             dest.unlink()
         return False
+
+
+def _looks_like_book(path: Path) -> bool:
+    """Return True if the file starts with PDF or ZIP/EPUB magic bytes."""
+    with open(path, "rb") as f:
+        head = f.read(8)
+    return head.startswith(b"%PDF-") or head.startswith(b"PK\x03\x04")
 
 
 def try_mirrors(mirror_urls: List[str], dest: Path, *, session: requests.Session) -> bool:

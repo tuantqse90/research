@@ -50,8 +50,9 @@ class SearchResult:
 
 
 def _safe_int(text: str) -> Optional[int]:
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return int(digits) if digits else None
+    """Return the first contiguous digit run in text as int, or None."""
+    m = re.search(r"\d+", text)
+    return int(m.group(0)) if m else None
 
 
 def _extract_title_from_cell(cell) -> str:
@@ -69,17 +70,26 @@ def _extract_title_from_cell(cell) -> str:
         tip = a.get("title", "")
         if "<br>" in tip:
             after_br = tip.split("<br>", 1)[1]
-            m = re.match(r"(.+?)\s*-\s*(.+?)\(\d{4}", after_br)
+            # author (non-greedy) - title (greedy) up to last (YEAR,
+            m = re.match(r"(.+?)\s*-\s*(.+)\s*\(\d{4}", after_br)
             if m:
                 title = m.group(2).strip()
                 if title:
                     return title
-    # Fallback: first <a> with plain text
+    # Fallback: bold <b> text in the cell contains the series/title header.
+    b = cell.find("b")
+    if b:
+        # Strip child <a> tooltip wrappers; keep plain text.
+        text = b.get_text(" ", strip=True)
+        if text and len(text) > 2:
+            return text
+    # Last resort: first <a> with plain text longer than 2 chars
+    # (skips single-letter badge links like "b").
     for a in cell.find_all("a"):
         if a.find("i") or a.find("font"):
             continue
         text = a.get_text(strip=True)
-        if text:
+        if text and len(text) > 2:
             return text
     return ""
 
@@ -132,6 +142,12 @@ def parse_search_results(html: str) -> List[SearchResult]:
             href = a["href"]
             if href.startswith("http"):
                 mirror_urls.append(href)
+            elif href.startswith("/"):
+                # libgen.vg native mirrors like /ads.php?md5=... — resolve
+                # against the search base. These are usually the most reliable.
+                mirror_urls.append(LIBGEN_BASE + href)
+        # Prioritize libgen.vg native mirror (most likely to work without JS).
+        mirror_urls.sort(key=lambda u: 0 if LIBGEN_BASE in u else 1)
 
         md5 = _extract_md5(mirror_urls)
 
