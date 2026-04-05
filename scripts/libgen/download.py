@@ -112,15 +112,28 @@ def _looks_like_book(path: Path) -> bool:
     return head.startswith(b"%PDF-") or head.startswith(b"PK\x03\x04")
 
 
-def try_mirrors(mirror_urls: List[str], dest: Path, *, session: requests.Session) -> bool:
-    """Walk mirror URLs in order until one yields a successful download."""
+def try_mirrors(
+    mirror_urls: List[str],
+    dest: Path,
+    *,
+    session: requests.Session,
+    retries_per_mirror: int = 3,
+) -> bool:
+    """Walk mirror URLs in order until one yields a successful download.
+
+    Libgen.vg's /ads.php generates a fresh session key on every fetch and the
+    key points at a random CDN node. A specific CDN node may return 502/503
+    transiently, so we re-resolve the mirror up to `retries_per_mirror` times
+    (getting a new key each time) before moving to the next mirror URL.
+    """
     for mirror in mirror_urls:
-        direct = resolve_direct_url(mirror, session=session)
-        if not direct:
-            continue
-        if download_file(direct, dest, session=session):
-            return True
-        time.sleep(1)
+        for attempt in range(retries_per_mirror):
+            direct = resolve_direct_url(mirror, session=session)
+            if not direct:
+                break  # page structure unsupported; no point retrying
+            if download_file(direct, dest, session=session):
+                return True
+            time.sleep(1 + attempt)
     return False
 
 
