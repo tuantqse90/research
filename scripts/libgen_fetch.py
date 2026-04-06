@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Fetch top-N books from libgen.vg for a topic and extract excerpts.
+"""Fetch top-N papers/books from libgen, arXiv, and IACR ePrint for a topic.
 
 Usage:
-  python scripts/libgen_fetch.py <topic> --top 5 --pages 30 --out topics/<dirname>
+  python scripts/libgen_fetch.py <topic> [--top 5] [--pages 30] [--sources all]
+
+Source selection:
+  --sources all      Search all sources (default)
+  --sources libgen   Search libgen only
+  --sources arxiv    Search arXiv only
+  --sources iacr     Search IACR ePrint only
+  --sources arxiv,iacr  Comma-separated combination
 """
 from __future__ import annotations
 
@@ -14,8 +21,10 @@ from pathlib import Path
 # Make `libgen` importable when this file is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from libgen.download import new_session, try_mirrors  # noqa: E402
+from libgen.arxiv import search_arxiv  # noqa: E402
+from libgen.download import download_file, new_session, try_mirrors  # noqa: E402
 from libgen.extract import write_excerpt  # noqa: E402
+from libgen.iacr import search_iacr  # noqa: E402
 from libgen.metadata import RunMetadata, SourceRecord, now_iso, write_metadata  # noqa: E402
 from libgen.search import search  # noqa: E402
 from libgen.slug import dated_dirname, slugify  # noqa: E402
@@ -36,7 +45,7 @@ def resolve_out_dir(base: Path) -> Path:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("topic", help="search topic")
-    parser.add_argument("--top", type=int, default=5)
+    parser.add_argument("--top", type=int, default=5, help="max results per source (default: 5)")
     parser.add_argument("--pages", type=int, default=30)
     parser.add_argument(
         "--out",
@@ -44,36 +53,80 @@ def main(argv: list[str]) -> int:
         default=None,
         help="output dir; defaults to topics/YYYY-MM-DD_<slug>",
     )
+    parser.add_argument(
+        "--sources",
+        default="all",
+        help="comma-separated list of sources: all, libgen, arxiv, iacr (default: all)",
+    )
     args = parser.parse_args(argv)
+
+    # Parse source selection
+    if args.sources.strip().lower() == "all":
+        enabled_sources = {"libgen", "arxiv", "iacr"}
+    else:
+        enabled_sources = {s.strip().lower() for s in args.sources.split(",")}
+        valid = {"libgen", "arxiv", "iacr"}
+        unknown = enabled_sources - valid
+        if unknown:
+            print(f"ERROR: unknown sources: {unknown}. Valid: {valid}", file=sys.stderr)
+            return 1
 
     out_dir = args.out or Path("topics") / dated_dirname(date.today().isoformat(), args.topic)
     out_dir = resolve_out_dir(out_dir)
     (out_dir / "sources").mkdir(parents=True, exist_ok=True)
     (out_dir / "summaries").mkdir(parents=True, exist_ok=True)
 
-    print(f"[1/4] searching libgen for: {args.topic!r}")
-    try:
-        results = search(args.topic)
-    except Exception as e:
-        print(f"ERROR: search failed: {e}", file=sys.stderr)
-        return 1
+    all_results = []
+    src_label = ", ".join(sorted(enabled_sources))
 
-    # Filter: pdf/epub only, sort by year desc (None last), take top N
-    filtered = [r for r in results if r.extension.lower() in {"pdf", "epub"}]
-    filtered.sort(key=lambda r: (r.year or 0), reverse=True)
-    chosen = filtered[: args.top]
+    # --- Search libgen ---
+    if "libgen" in enabled_sources:
+        print(f"[1/4] searching libgen for: {args.topic!r}")
+        try:
+            libgen_results = search(args.topic)
+            libgen_pdf = [r for r in libgen_results if r.extension.lower() in {"pdf", "epub"}]
+            libgen_pdf.sort(key=lambda r: (r.year or 0), reverse=True)
+            all_results.extend(("libgen", r) for r in libgen_pdf[:args.top])
+            print(f"       libgen: {len(libgen_pdf)} found, taking top {min(len(libgen_pdf), args.top)}")
+        except Exception as e:
+            print(f"       libgen: search failed ({e})")
+
+    # --- Search arXiv (no tor needed) ---
+    if "arxiv" in enabled_sources:
+        print(f"[1/4] searching arXiv for: {args.topic!r}")
+        try:
+            arxiv_session = new_session()
+            arxiv_results = search_arxiv(args.topic, max_results=args.top, session=arxiv_session)
+            all_results.extend(("arxiv", r) for r in arxiv_results)
+            print(f"       arXiv:  {len(arxiv_results)} found")
+        except Exception as e:
+            print(f"       arXiv:  search failed ({e})")
+
+    # --- Search IACR ePrint (no tor needed) ---
+    if "iacr" in enabled_sources:
+        print(f"[1/4] searching IACR ePrint for: {args.topic!r}")
+        try:
+            iacr_session = new_session()
+            iacr_results = search_iacr(args.topic, max_results=args.top, session=iacr_session)
+            all_results.extend(("iacr", r) for r in iacr_results)
+            print(f"       IACR:   {len(iacr_results)} found")
+        except Exception as e:
+            print(f"       IACR:   search failed ({e})")
+
+    # Deduplicate by title similarity, keep all (each source already capped at --top)
+    chosen = _dedupe(all_results)
 
     if not chosen:
         print("no PDF/EPUB results found for this topic", file=sys.stderr)
         return 2
 
-    print(f"[2/4] found {len(chosen)} candidates, downloading...")
+    print(f"[2/4] selected {len(chosen)} candidates, downloading...")
     session = new_session()
     meta = RunMetadata(topic=args.topic, fetched_at=now_iso(), out_dir=str(out_dir))
 
-    for i, r in enumerate(chosen, start=1):
+    for i, (source_name, r) in enumerate(chosen, start=1):
         sid = f"{i:02d}"
-        slug = slugify(r.title)[:60] or f"book-{sid}"
+        slug = slugify(r.title)[:60] or f"paper-{sid}"
         local = out_dir / "sources" / f"{sid}_{slug}.{r.extension.lower()}"
         excerpt = out_dir / "sources" / f"{sid}_{slug}_excerpt.txt"
 
@@ -89,11 +142,22 @@ def main(argv: list[str]) -> int:
             local_path=str(local.relative_to(out_dir)),
             excerpt_path=str(excerpt.relative_to(out_dir)),
         )
+        rec.note = f"source: {source_name}"
 
-        ok = try_mirrors(r.mirror_urls, local, session=session)
+        # Download: arXiv/IACR have direct PDF links, libgen needs mirror resolution
+        ok = False
+        if source_name in ("arxiv", "iacr"):
+            # Direct PDF download, no mirror resolution needed
+            for url in r.mirror_urls:
+                ok = download_file(url, local, session=session)
+                if ok:
+                    break
+        else:
+            ok = try_mirrors(r.mirror_urls, local, session=session)
+
         if not ok:
             rec.status = "download_failed"
-            rec.note = "all mirrors failed"
+            rec.note += "; all mirrors failed"
             meta.sources.append(rec)
             print(f"  [{sid}] FAIL download: {r.title[:60]}")
             continue
@@ -113,17 +177,16 @@ def main(argv: list[str]) -> int:
                 )
                 rec.status = "ok"
             else:
-                # EPUB: skip text extraction, just note it
                 excerpt.write_text(
                     f"=== METADATA ===\nTitle: {r.title}\nExtension: {r.extension}\n"
                     "(EPUB excerpt extraction not supported in v1)\n",
                     encoding="utf-8",
                 )
                 rec.status = "ok"
-                rec.note = "epub: no text extracted"
+                rec.note += "; epub: no text extracted"
         except Exception as e:
             rec.status = "extract_failed"
-            rec.note = str(e)[:200]
+            rec.note += f"; {str(e)[:200]}"
             print(f"  [{sid}] FAIL extract: {e}")
 
         meta.sources.append(rec)
@@ -137,6 +200,23 @@ def main(argv: list[str]) -> int:
         print("ERROR: fewer than 2 sources succeeded", file=sys.stderr)
         return 1
     return 0
+
+
+def _dedupe(
+    tagged_results: list[tuple[str, object]],
+) -> list[tuple[str, object]]:
+    """Deduplicate by normalized title. Each source already capped at --top."""
+    seen_titles: set[str] = set()
+    result = []
+
+    for source_name, r in tagged_results:
+        norm = slugify(r.title)[:40]
+        if norm in seen_titles:
+            continue
+        seen_titles.add(norm)
+        result.append((source_name, r))
+
+    return result
 
 
 if __name__ == "__main__":
